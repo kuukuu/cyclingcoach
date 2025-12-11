@@ -1,5 +1,5 @@
 /**
- * AI Cycling Coach for Zwift (Powered by Gemini & Intervals.icu)
+ * Aixle - AI Cycling Coach (Powered by Gemini & Intervals.icu)
  * 
  * This script automates daily workout generation based on your fitness data.
  * Features:
@@ -32,7 +32,7 @@ const USER_SETTINGS = {
   // System Configuration
   SPREADSHEET_ID: "YOUR_SPREADSHEET_ID", // ID of the Google Sheet for logging
   SHEET_NAME: "training_log",
-  WORKOUT_FOLDER: "zwo_AI_generated",    // Google Drive folder name for .zwo files
+  WORKOUT_FOLDER: "Aixle_Workouts",      // ★ Changed to match brand name
   EMAIL_TO: "your_email@example.com" 
 };
 
@@ -72,8 +72,8 @@ const SYSTEM_SETTINGS = {
 // =========================================================
 const TRANSLATIONS = {
   en: {
-    subject_prefix: "[Zwift AI] Today's Pick: ",
-    greeting: "Here is your AI Coach training plan for today.",
+    subject_prefix: "[Aixle] Today's Pick: ",
+    greeting: "Here is your Aixle training plan for today.",
     phase_title: "Current Phase",
     weeks_to_goal: "Weeks to Goal",
     focus: "Focus",
@@ -82,11 +82,11 @@ const TRANSLATIONS = {
     why_title: "【Why / Reason】",
     strategy_title: "【Strategy / Explanation】",
     other_options: "Other Options",
-    footer: "*Saved to Google Drive. Please wait for Zwift sync."
+    footer: "*Saved to Google Drive (Aixle_Workouts). Please wait for sync."
   },
   ja: {
-    subject_prefix: "[Zwift AI] 本日の推奨: ",
-    greeting: "お疲れ様です。現在のフェーズに基づいた推奨メニューです。",
+    subject_prefix: "[Aixle] 本日の推奨: ",
+    greeting: "お疲れ様です。Aixleが分析した本日の推奨メニューです。",
     phase_title: "現在のフェーズ",
     weeks_to_goal: "目標まで",
     focus: "注力ポイント",
@@ -95,11 +95,11 @@ const TRANSLATIONS = {
     why_title: "【選定理由】",
     strategy_title: "【内容・攻略法】",
     other_options: "その他の選択肢",
-    footer: "※Google Driveに保存されました。Zwiftへの同期をお待ちください。"
+    footer: "※Googleドライブ(Aixle_Workouts)に保存されました。Zwiftへの同期をお待ちください。"
   },
   es: {
-    subject_prefix: "[Zwift AI] Selección de hoy: ",
-    greeting: "Aquí tienes tu plan de entrenamiento de AI Coach para hoy.",
+    subject_prefix: "[Aixle] Selección de hoy: ",
+    greeting: "Aquí tienes tu plan de entrenamiento de Aixle para hoy.",
     phase_title: "Fase Actual",
     weeks_to_goal: "Semanas para el objetivo",
     focus: "Enfoque",
@@ -108,11 +108,11 @@ const TRANSLATIONS = {
     why_title: "【Razón】",
     strategy_title: "【Estrategia】",
     other_options: "Otras opciones",
-    footer: "*Guardado en Google Drive. Espera la sincronización con Zwift."
+    footer: "*Guardado en Google Drive. Espera la sincronización."
   },
   fr: {
-    subject_prefix: "[Zwift AI] Choix du jour: ",
-    greeting: "Voici votre plan d'entraînement AI Coach pour aujourd'hui.",
+    subject_prefix: "[Aixle] Choix du jour: ",
+    greeting: "Voici votre plan d'entraînement Aixle pour aujourd'hui.",
     phase_title: "Phase Actuelle",
     weeks_to_goal: "Semaines avant l'objectif",
     focus: "Focus",
@@ -121,7 +121,7 @@ const TRANSLATIONS = {
     why_title: "【Raison】",
     strategy_title: "【Stratégie】",
     other_options: "Autres options",
-    footer: "*Enregistré sur Google Drive. Veuillez attendre la synchronisation Zwift."
+    footer: "*Enregistré sur Google Drive. Veuillez attendre la synchronisation."
   }
 };
 
@@ -218,7 +218,8 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
     if (result.success) {
       const safeType = type.replace(/[^a-zA-Z0-9]/g, ""); 
-      const fileName = `G3_${safeType}_${fileDateStr}.zwo`;
+      // ★ Updated Prefix to Aixle_
+      const fileName = `Aixle_${safeType}_${fileDateStr}.zwo`;
       
       const blob = Utilities.newBlob(result.xml, "text/xml", fileName);
       folder.createFile(blob);
@@ -316,7 +317,6 @@ function callGeminiAPI(prompt) {
         
         if (!contentText) throw new Error("API returned empty content");
 
-        // Clean and Parse JSON
         let result;
         try {
           const cleanedText = contentText.replace(/^```json/gm, "").replace(/^```/gm, "").trim();
@@ -359,7 +359,6 @@ function callGeminiAPI(prompt) {
 // 10. HELPER: Prompt Construction
 // =========================================================
 function createPrompt(type, summary, phaseInfo, dateStr) {
-  // Determine language for analysis text
   const langMap = { "ja": "Japanese", "en": "English", "es": "Spanish", "fr": "French" };
   const analysisLang = langMap[USER_SETTINGS.LANGUAGE] || "English";
 
@@ -386,6 +385,7 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
   - You MUST include motivational or instructional text messages.
   - **LANGUAGE: Messages MUST be in ENGLISH.** (Even if the user's language is different, Zwift works best with English text).
   - Nest them: \`<SteadyState ... ><TextEvent timeoffset="10" message="Keep pushing!"/></SteadyState>\`
+  - Name Format: <name>Aixle_${type.replace(/[^a-zA-Z0-9]/g,"")}_${dateStr}</name>
 
 **4. Evaluate Recommendation (1-10):**
 - Logic: Based on the **Current Phase** and **TSB**, is "${type}" correct?
@@ -396,7 +396,7 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
   "explanation": "Strategy explanation in **${analysisLang}**.",
   "recommendation_score": (integer 1-10),
   "recommendation_reason": "Reason based on Phase(${phaseInfo.phaseName}) and TSB in **${analysisLang}**.",
-  "xml": "<workout_file>...<author>AI Coach</author><name>G3_${type.replace(/[^a-zA-Z0-9]/g,"")}_${dateStr}</name>...valid xml...</workout_file>"
+  "xml": "<workout_file>...<author>Aixle AI Coach</author><name>Aixle_${type.replace(/[^a-zA-Z0-9]/g,"")}_${dateStr}</name>...valid xml...</workout_file>"
 }
 `;
 }
@@ -405,7 +405,6 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
 // 11. HELPER: Send Email (Dynamic Language)
 // =========================================================
 function sendSmartSummaryEmail(summary, phaseInfo, generatedResults) {
-  // Get translations based on user setting, fallback to English
   const t = TRANSLATIONS[USER_SETTINGS.LANGUAGE] || TRANSLATIONS.en;
   
   const bestWorkout = generatedResults[0]; 
