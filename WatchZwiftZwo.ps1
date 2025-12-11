@@ -1,38 +1,40 @@
 # -*- coding: utf-8 -*-
 # WatchZwiftZwo.ps1
 #
-# A script to auto-sync .zwo files from Google Drive to Zwift.
-# It polls the source folder and copies new workouts to the Zwift folder.
-# It also cleans up old workouts to keep the folder tidy.
+# Aixle Sync Agent for Windows
+# Watches the Google Drive folder and syncs .zwo files to Zwift "Aixle" folder.
 #
-# Requirement: Google Drive for Desktop
-# Optional: 'BurntToast' module for Windows Notifications (Install-Module -Name BurntToast)
+# How to use:
+# 1. Edit $sourceFolder (Your Google Drive path)
+# 2. Edit $zwiftId (Your Zwift ID found in Documents\Zwift\Workouts\)
+# 3. Run with PowerShell
 
 # ================= CONFIGURATION (EDIT HERE) =================
 
-# 1. Path to the Google Drive folder where the AI saves .zwo files
-#    Example: "G:\My Drive\zwo_AI_generated"
-$sourceFolder = "G:\My Drive\zwo_AI_generated" 
+# 1. Google Drive folder (Must match USER_SETTINGS.WORKOUT_FOLDER in GAS)
+#    Googleドライブにある、GASがファイルを生成するフォルダのフルパス
+$sourceFolder = "G:\My Drive\Aixle_Workouts" 
 
-# 2. Your Zwift ID (Found in Documents\Zwift\Workouts\XXXXXX)
+# 2. Your Zwift ID
+#    ドキュメント\Zwift\Workouts\ の中にある数字のフォルダ名
 $zwiftId = "123456" 
 
-# 3. Destination folder name inside Zwift Workouts
-#    It is recommended to use a subfolder like "AI_Workouts" to separate from manual files.
-$destSubFolderName = "AI_Workouts"
+# 3. Folder name inside Zwift (Fixed to "Aixle")
+#    Zwiftのゲーム画面で表示されるカテゴリ名になります
+$destSubFolderName = "Aixle"
 
-# 4. Cleanup settings: Delete files from Zwift folder if they are older than X days
-$daysToKeep = 3
+# 4. Cleanup: Delete files older than X days from Zwift folder
+$daysToKeep = 7
 
 # =============================================================
 
-# Construct the full destination path
+# Construct paths
 $docsPath = [Environment]::GetFolderPath("MyDocuments")
 $destinationFolder = Join-Path $docsPath "Zwift\Workouts\$zwiftId\$destSubFolderName"
-$logFile = "$PSScriptRoot\WatchZwiftZwo.log"
+$logFile = "$PSScriptRoot\aixle_sync.log"
 $pollingIntervalSeconds = 30
 
-# Import BurntToast for notifications (Ignored if not installed)
+# Import BurntToast for notifications (Optional)
 Import-Module BurntToast -ErrorAction SilentlyContinue
 
 # Setup Tray Icon
@@ -40,34 +42,33 @@ Add-Type -AssemblyName System.Windows.Forms
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
 $notifyIcon.Visible = $true
-$notifyIcon.Text = "Zwift AI Sync (Running)"
+$notifyIcon.Text = "Aixle Sync (Running)"
 
 # Logging Function
 function Write-Log($msg) {
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $logMsg = "$timestamp $msg"
+    $logMsg = "[$timestamp] $msg"
     Write-Host $logMsg
     $logMsg | Out-File -FilePath $script:logFile -Append -Encoding UTF8
 }
 
-Write-Log "===== Watcher Started ====="
+Write-Log "===== Aixle Sync Agent Started ====="
 Write-Log "Source: $sourceFolder"
-Write-Log "Dest:   $destinationFolder"
+Write-Log "Target: $destinationFolder"
 
 # Validation
 if (-not (Test-Path $sourceFolder)) {
     Write-Log "ERROR: Source folder not found. Check Google Drive path."
     if (Get-Module -ListAvailable -Name BurntToast) {
-        New-BurntToastNotification -Text "Zwift Sync Error", "Source folder not found!"
+        New-BurntToastNotification -Text "Aixle Error", "Google Drive folder not found!"
     }
-    # Keep running to retry later (e.g. if Drive takes time to mount)
 }
 
 # Create Destination if missing
 if (-not (Test-Path $destinationFolder)) {
     try {
         New-Item -Path $destinationFolder -ItemType Directory -Force | Out-Null
-        Write-Log "Created destination folder."
+        Write-Log "Created Zwift/Aixle folder."
     } catch {
         Write-Log "ERROR: Could not create destination folder."
         return
@@ -78,11 +79,10 @@ if (-not (Test-Path $destinationFolder)) {
 function Start-Polling() {
     if (-not (Test-Path $sourceFolder)) { return }
 
-    # Get source files
     $sourceFiles = Get-ChildItem -Path $script:sourceFolder -Filter "*.zwo"
     $sourceFileNames = @($sourceFiles | Select-Object -ExpandProperty Name)
 
-    # 1. Copy New/Modified Files
+    # 1. Sync New Files
     foreach ($sourceFile in $sourceFiles) {
         $fileName = $sourceFile.Name
         $destFile = Join-Path $script:destinationFolder $fileName
@@ -92,7 +92,6 @@ function Start-Polling() {
             $shouldCopy = $true
         } else {
             $destFileItem = Get-Item $destFile
-            # Copy if source is newer
             if ($sourceFile.LastWriteTime -gt $destFileItem.LastWriteTime) {
                 $shouldCopy = $true
             }
@@ -101,25 +100,21 @@ function Start-Polling() {
         if ($shouldCopy) {
             try {
                 Copy-Item -Path $sourceFile.FullName -Destination $destFile -Force
-                Write-Log "Copied: $fileName"
+                Write-Log "Synced: $fileName"
                 if (Get-Module -ListAvailable -Name BurntToast) {
-                    New-BurntToastNotification -Text "Zwift Workout Added", "Menu: $fileName"
+                    New-BurntToastNotification -Text "Aixle Workout Ready", "New Menu: $fileName"
                 }
             } catch {
-                Write-Log "Copy Failed: $_"
+                Write-Log "Sync Failed: $_"
             }
         }
     }
 
     # 2. Cleanup Old Files
-    # Remove files in the destination that are NOT in the source anymore (optional)
-    # OR remove files that are simply too old to be relevant.
-    # Here: We remove files older than $daysToKeep to keep the list short.
-    
     $deadline = (Get-Date).AddDays(-$script:daysToKeep)
     
     Get-ChildItem -Path $script:destinationFolder -Filter "*.zwo" | ForEach-Object {
-        # Only delete if it is NOT in the source folder (preserved in Drive) AND is old
+        # Delete if file is NOT in source (Google Drive) AND matches date criteria
         if (-not ($sourceFileNames -contains $_.Name) -and $_.LastWriteTime -lt $deadline) {
             try {
                 Remove-Item $_.FullName -Force
