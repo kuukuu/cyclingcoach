@@ -80,6 +80,11 @@ const TRANSLATIONS = {
     focus: "Focus",
     goal_section: "Current Goal",
     status: "Athlete Status",
+    recovery_title: "Recovery & Wellness",
+    recovery_status: "Recovery Status",
+    sleep: "Sleep",
+    hrv: "HRV",
+    resting_hr: "Resting HR",
     recommendation_title: "★ BEST RECOMMENDATION ★",
     why_title: "【Why / Reason】",
     strategy_title: "【Strategy / Explanation】",
@@ -95,6 +100,11 @@ const TRANSLATIONS = {
     focus: "注力ポイント",
     goal_section: "【設定目標】",
     status: "コンディション",
+    recovery_title: "リカバリー＆ウェルネス",
+    recovery_status: "回復状態",
+    sleep: "睡眠",
+    hrv: "HRV",
+    resting_hr: "安静時心拍",
     recommendation_title: "★ 本日の推奨メニュー ★",
     why_title: "【選定理由】",
     strategy_title: "【内容・攻略法】",
@@ -110,6 +120,11 @@ const TRANSLATIONS = {
     focus: "Enfoque",
     goal_section: "Objetivo Actual",
     status: "Estado del Atleta",
+    recovery_title: "Recuperación y Bienestar",
+    recovery_status: "Estado de Recuperación",
+    sleep: "Sueño",
+    hrv: "VFC",
+    resting_hr: "FC en Reposo",
     recommendation_title: "★ MEJOR RECOMENDACIÓN ★",
     why_title: "【Razón】",
     strategy_title: "【Estrategia】",
@@ -125,6 +140,11 @@ const TRANSLATIONS = {
     focus: "Focus",
     goal_section: "Objectif Actuel",
     status: "Statut de l'athlète",
+    recovery_title: "Récupération et Bien-être",
+    recovery_status: "État de Récupération",
+    sleep: "Sommeil",
+    hrv: "VFC",
+    resting_hr: "FC au Repos",
     recommendation_title: "★ MEILLEURE RECOMMANDATION ★",
     why_title: "【Raison】",
     strategy_title: "【Stratégie】",
@@ -151,7 +171,152 @@ const HEADERS_FIXED = [
 ];
 
 // =========================================================
-// 6. MAIN FUNCTION: Fetch Data
+// 6. WELLNESS DATA: Fetch from Intervals.icu (Whoop/Garmin/Oura)
+// =========================================================
+function fetchWellnessData(daysBack = 7) {
+  const today = new Date();
+  const oldest = new Date(today);
+  oldest.setDate(today.getDate() - daysBack);
+
+  const todayStr = formatDateISO(today);
+  const oldestStr = formatDateISO(oldest);
+
+  // Use date range endpoint (more reliable, returns fresh data)
+  const url = "https://intervals.icu/api/v1/athlete/0/wellness?oldest=" + oldestStr + "&newest=" + todayStr;
+
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      headers: { "Authorization": ICU_AUTH_HEADER },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() === 200) {
+      const dataArray = JSON.parse(response.getContentText());
+
+      // Map and sort by date descending (newest first)
+      const wellnessRecords = dataArray.map(function(data) {
+        // Convert sleepSecs to hours (API returns seconds)
+        const sleepHours = data.sleepSecs ? data.sleepSecs / 3600 : 0;
+
+        return {
+          date: data.id,                             // Date is stored as "id"
+          sleep: sleepHours,                         // Converted to hours
+          sleepQuality: data.sleepQuality || null,   // 1-5 scale
+          sleepScore: data.sleepScore || null,       // Whoop sleep score (0-100)
+          restingHR: data.restingHR || null,         // Resting heart rate
+          hrv: data.hrv || null,                     // HRV rMSSD
+          hrvSDNN: data.hrvSDNN || null,             // HRV SDNN (if available)
+          recovery: data.readiness || null,          // Whoop recovery score is stored as "readiness"
+          spO2: data.spO2 || null,                   // Blood oxygen
+          respiration: data.respiration || null,     // Breathing rate
+          soreness: data.soreness || null,           // 1-5 scale
+          fatigue: data.fatigue || null,             // 1-5 scale
+          stress: data.stress || null,               // 1-5 scale
+          mood: data.mood || null                    // 1-5 scale
+        };
+      });
+
+      // Sort by date descending (newest first)
+      wellnessRecords.sort(function(a, b) {
+        return b.date.localeCompare(a.date);
+      });
+
+      return wellnessRecords;
+    }
+  } catch (e) {
+    Logger.log("Failed to fetch wellness data: " + e.toString());
+  }
+
+  return [];
+}
+
+function createWellnessSummary(wellnessRecords) {
+  if (!wellnessRecords || wellnessRecords.length === 0) {
+    return {
+      available: false,
+      message: "No wellness data available"
+    };
+  }
+
+  // Find the most recent record with actual wellness data (sleep/HRV/recovery)
+  // Today's data might be empty if Whoop hasn't synced yet
+  const latestWithData = wellnessRecords.find(r => r.sleep > 0 || r.hrv || r.recovery) || wellnessRecords[0];
+  const last7Days = wellnessRecords.slice(0, 7);
+
+  // Calculate averages for trend analysis
+  const avgSleep = average(last7Days.map(w => w.sleep).filter(v => v > 0));
+  const avgHRV = average(last7Days.map(w => w.hrv).filter(v => v != null));
+  const avgRestingHR = average(last7Days.map(w => w.restingHR).filter(v => v != null));
+  const avgRecovery = average(last7Days.map(w => w.recovery).filter(v => v != null));
+
+  // Determine recovery status based on latest data with values
+  let recoveryStatus = "Unknown";
+  let intensityModifier = 1.0; // Multiplier for workout intensity
+
+  if (latestWithData.recovery != null) {
+    if (latestWithData.recovery >= 67) {
+      recoveryStatus = "Green (Primed)";
+      intensityModifier = 1.0; // Full intensity OK
+    } else if (latestWithData.recovery >= 34) {
+      recoveryStatus = "Yellow (Recovering)";
+      intensityModifier = 0.85; // Reduce intensity
+    } else {
+      recoveryStatus = "Red (Strained)";
+      intensityModifier = 0.7; // Significantly reduce
+    }
+  } else if (latestWithData.hrv != null && avgHRV > 0) {
+    // Fallback: Use HRV trend if no recovery score
+    const hrvDeviation = (latestWithData.hrv - avgHRV) / avgHRV;
+    if (hrvDeviation >= 0.05) {
+      recoveryStatus = "Above Baseline (Well Recovered)";
+      intensityModifier = 1.0;
+    } else if (hrvDeviation >= -0.1) {
+      recoveryStatus = "Normal";
+      intensityModifier = 0.9;
+    } else {
+      recoveryStatus = "Below Baseline (Fatigued)";
+      intensityModifier = 0.75;
+    }
+  }
+
+  // Sleep quality assessment
+  let sleepStatus = "Unknown";
+  if (latestWithData.sleep > 0) {
+    if (latestWithData.sleep >= 7.5) sleepStatus = "Excellent";
+    else if (latestWithData.sleep >= 6.5) sleepStatus = "Adequate";
+    else if (latestWithData.sleep >= 5) sleepStatus = "Poor";
+    else sleepStatus = "Insufficient";
+  }
+
+  return {
+    available: true,
+    today: {
+      date: latestWithData.date,
+      sleep: latestWithData.sleep,
+      sleepQuality: latestWithData.sleepQuality,
+      sleepScore: latestWithData.sleepScore,
+      restingHR: latestWithData.restingHR,
+      hrv: latestWithData.hrv,
+      recovery: latestWithData.recovery,
+      soreness: latestWithData.soreness,
+      fatigue: latestWithData.fatigue,
+      stress: latestWithData.stress,
+      mood: latestWithData.mood
+    },
+    averages: {
+      sleep: avgSleep,
+      hrv: avgHRV,
+      restingHR: avgRestingHR,
+      recovery: avgRecovery
+    },
+    recoveryStatus: recoveryStatus,
+    sleepStatus: sleepStatus,
+    intensityModifier: intensityModifier
+  };
+}
+
+// =========================================================
+// 7. MAIN FUNCTION: Fetch Activity Data
 // =========================================================
 function fetchAndLogActivities() {
   const sheet = SpreadsheetApp.openById(USER_SETTINGS.SPREADSHEET_ID).getSheetByName(USER_SETTINGS.SHEET_NAME);
@@ -190,7 +355,7 @@ function fetchAndLogActivities() {
 }
 
 // =========================================================
-// 7. MAIN FUNCTION: Generate Workouts
+// 8. MAIN FUNCTION: Generate Workouts
 // =========================================================
 function generateOptimalZwiftWorkoutsAutoByGemini() {
   const folder = getOrCreateFolder(USER_SETTINGS.WORKOUT_FOLDER);
@@ -200,11 +365,22 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
   // Create Athlete Summary
   const summary = createAthleteSummary(data);
-  
+
+  // Fetch Wellness Data (Sleep, Recovery, HRV from Whoop/Garmin/Oura)
+  const wellnessRecords = fetchWellnessData(7);
+  const wellness = createWellnessSummary(wellnessRecords);
+
   // Calculate Periodization Phase
   const phaseInfo = calculateTrainingPhase(USER_SETTINGS.TARGET_DATE);
-  Logger.log(`Athlete Summary: TSB=${summary.tsb_current.toFixed(1)}`);
-  Logger.log(`Current Phase: ${phaseInfo.phaseName} (${phaseInfo.weeksOut} weeks out)`);
+
+  Logger.log("Athlete Summary: TSB=" + summary.tsb_current.toFixed(1));
+  Logger.log("Current Phase: " + phaseInfo.phaseName + " (" + phaseInfo.weeksOut + " weeks out)");
+  if (wellness && wellness.available) {
+    Logger.log("Recovery Status: " + wellness.recoveryStatus + " | Sleep: " + wellness.today.sleep.toFixed(1) + "h (" + wellness.sleepStatus + ")");
+    Logger.log("HRV: " + (wellness.today.hrv || 'N/A') + " | Resting HR: " + (wellness.today.restingHR || 'N/A'));
+  } else {
+    Logger.log("Wellness data: Not available");
+  }
 
   // Workout Types to Generate
   const types = ["FTP_Threshold", "VO2max_HighIntensity", "Endurance_Tempo"];
@@ -217,9 +393,9 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
   for (const type of types) {
     Logger.log(`Generating workout for: ${type}...`);
-    
-    // Create Prompt
-    const prompt = createPrompt(type, summary, phaseInfo, dateStr);
+
+    // Create Prompt (now includes wellness data)
+    const prompt = createPrompt(type, summary, phaseInfo, dateStr, wellness);
 
     // Call Gemini API
     const result = callGeminiAPI(prompt);
@@ -251,12 +427,12 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
   // Send Email
   if (generatedResults.length > 0) {
-    sendSmartSummaryEmail(summary, phaseInfo, generatedResults);
+    sendSmartSummaryEmail(summary, phaseInfo, generatedResults, wellness);
   }
 }
 
 // =========================================================
-// 8. LOGIC: Periodization Phase Calculation
+// 9. LOGIC: Periodization Phase Calculation
 // =========================================================
 function calculateTrainingPhase(targetDateStr) {
   const today = new Date();
@@ -364,32 +540,61 @@ function callGeminiAPI(prompt) {
 }
 
 // =========================================================
-// 10. HELPER: Prompt Construction
+// 11. HELPER: Prompt Construction
 // =========================================================
-function createPrompt(type, summary, phaseInfo, dateStr) {
+function createPrompt(type, summary, phaseInfo, dateStr, wellness) {
   const langMap = { "ja": "Japanese", "en": "English", "es": "Spanish", "fr": "French" };
   const analysisLang = langMap[USER_SETTINGS.LANGUAGE] || "English";
 
   // Zwift Display Name (Clean, short name without "Aixle_" prefix)
   const safeType = type.replace(/[^a-zA-Z0-9]/g,"");
-  const zwiftDisplayName = `${safeType}_${dateStr}`; 
+  const zwiftDisplayName = `${safeType}_${dateStr}`;
+
+  // Build wellness context string
+  let wellnessContext = "";
+  if (wellness && wellness.available) {
+    const w = wellness.today;
+    const avg = wellness.averages;
+
+    wellnessContext = `
+**1b. Recovery & Wellness Data (from Whoop/wearable):**
+- **Recovery Status:** ${wellness.recoveryStatus}
+- **Recommended Intensity Modifier:** ${(wellness.intensityModifier * 100).toFixed(0)}%
+- **Sleep:** ${w.sleep ? w.sleep.toFixed(1) + 'h' : 'N/A'} (${wellness.sleepStatus}) | 7-day avg: ${avg.sleep ? avg.sleep.toFixed(1) + 'h' : 'N/A'}
+- **HRV (rMSSD):** ${w.hrv || 'N/A'} ms | 7-day avg: ${avg.hrv ? avg.hrv.toFixed(0) : 'N/A'} ms
+- **Resting HR:** ${w.restingHR || 'N/A'} bpm | 7-day avg: ${avg.restingHR ? avg.restingHR.toFixed(0) : 'N/A'} bpm
+- **Whoop Recovery Score:** ${w.recovery != null ? w.recovery + '%' : 'N/A'}
+${w.soreness ? `- **Soreness:** ${w.soreness}/5` : ''}
+${w.fatigue ? `- **Fatigue:** ${w.fatigue}/5` : ''}
+${w.stress ? `- **Stress:** ${w.stress}/5` : ''}
+${w.mood ? `- **Mood:** ${w.mood}/5` : ''}
+
+**CRITICAL RECOVERY RULES:**
+- If Recovery Status is "Red (Strained)" or HRV is significantly below baseline: STRONGLY favor Endurance/Recovery workouts. VO2max/Threshold should score very low (1-3).
+- If Recovery Status is "Yellow (Recovering)": Reduce interval intensity by 5-10%. Favor Tempo/SST over VO2max.
+- If Recovery Status is "Green (Primed)": Full intensity is appropriate. High-intensity workouts can score higher.
+- Poor sleep (<6h) should reduce recommendation scores for high-intensity work.
+`;
+  }
 
   return `
 You are an expert cycling coach using the logic of Coggan, Friel, and Seiler.
 Generate a Zwift workout (.zwo) and evaluate its suitability.
 
-**1. Athlete Context:**
+**1a. Athlete Training Context:**
 - **Goal:** ${USER_SETTINGS.GOAL_DESCRIPTION}
 - **Target Race:** In ${phaseInfo.weeksOut} weeks.
 - **Current Phase:** "${phaseInfo.phaseName}"
 - **Phase Focus:** ${phaseInfo.focus}
 - **Current TSB:** ${summary.tsb_current.toFixed(1)}
 - **Recent Load (Z5+):** ${summary.z5_recent_total > 1500 ? "High" : "Normal"}
-
+${wellnessContext}
 **2. Assignment: Design a "${type}" Workout**
 - **Duration:** 60 min (+/- 5min).
 - **Structure:** Engaging (Pyramids, Over-Unders). NO boring steady states.
-- **Intensity:** Adjust based on TSB. If TSB < -20, reduce intensity significantly.
+- **Intensity:** Adjust based on TSB AND Recovery Status.
+  - If TSB < -20 OR Recovery is Red/Yellow, reduce intensity significantly.
+  - Apply the Intensity Modifier (${wellness && wellness.available ? (wellness.intensityModifier * 100).toFixed(0) + '%' : '100%'}) to target power zones.
 
 **3. REQUIRED ZWO FEATURES (Critical):**
 - **Cadence:** You MUST specify target cadence for every interval using \`Cadence="85"\`.
@@ -400,29 +605,43 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
   - **Workout Name:** The <name> tag MUST be exactly: "${zwiftDisplayName}" (Do NOT add "Aixle_" prefix here).
 
 **4. Evaluate Recommendation (1-10):**
-- Logic: Based on the **Current Phase** and **TSB**, is "${type}" correct?
+- Logic: Based on **Current Phase**, **TSB**, AND **Recovery/Wellness Status**, is "${type}" the right choice today?
+- A well-recovered athlete in Build phase doing Threshold = high score.
+- A poorly-recovered athlete (Red status, low HRV) doing VO2max = very low score (1-3).
 - Example: If Phase is "Base", VO2max should score low (unless maintenance). If Phase is "Peak", high volume SST should score low.
 
 **Output Format (JSON Only):**
 {
-  "explanation": "Strategy explanation in **${analysisLang}**.",
+  "explanation": "Strategy explanation in **${analysisLang}**. Include how recovery status influenced the workout design.",
   "recommendation_score": (integer 1-10),
-  "recommendation_reason": "Reason based on Phase(${phaseInfo.phaseName}) and TSB in **${analysisLang}**.",
+  "recommendation_reason": "Reason based on Phase(${phaseInfo.phaseName}), TSB, AND Recovery Status in **${analysisLang}**.",
   "xml": "<workout_file>...<author>Aixle AI Coach</author><name>${zwiftDisplayName}</name>...valid xml...</workout_file>"
 }
 `;
 }
 
 // =========================================================
-// 11. HELPER: Send Email (Dynamic Language)
+// 12. HELPER: Send Email (Dynamic Language)
 // =========================================================
-function sendSmartSummaryEmail(summary, phaseInfo, generatedResults) {
+function sendSmartSummaryEmail(summary, phaseInfo, generatedResults, wellness) {
   const t = TRANSLATIONS[USER_SETTINGS.LANGUAGE] || TRANSLATIONS.en;
   
   const bestWorkout = generatedResults[0]; 
   const attachments = generatedResults.map(r => r.blob);
-  
-  const subject = `${t.subject_prefix}${bestWorkout.type} (${Utilities.formatDate(new Date(), SYSTEM_SETTINGS.TIMEZONE, "MM/dd")})`;
+
+  // Add recovery indicator to subject based on status
+  let recoveryTag = "";
+  if (wellness && wellness.available) {
+    if (wellness.recoveryStatus.includes("Green") || wellness.recoveryStatus.includes("Primed") || wellness.recoveryStatus.includes("Well Recovered")) {
+      recoveryTag = "[GREEN] ";
+    } else if (wellness.recoveryStatus.includes("Yellow") || wellness.recoveryStatus.includes("Normal")) {
+      recoveryTag = "[YELLOW] ";
+    } else if (wellness.recoveryStatus.includes("Red") || wellness.recoveryStatus.includes("Fatigued")) {
+      recoveryTag = "[RED] ";
+    }
+  }
+
+  const subject = t.subject_prefix + recoveryTag + bestWorkout.type + " (" + Utilities.formatDate(new Date(), SYSTEM_SETTINGS.TIMEZONE, "MM/dd") + ")";
 
   let body = `${t.greeting}\n\n`;
 
@@ -439,7 +658,24 @@ ${USER_SETTINGS.GOAL_DESCRIPTION}
 
 ${t.status}:
 CTL: ${summary.ctl_90.toFixed(1)} / TSB: ${summary.tsb_current.toFixed(1)}
+`;
 
+  // Add Wellness/Recovery Section
+  if (wellness && wellness.available) {
+    const w = wellness.today;
+    body += `
+-----------------------------------
+${t.recovery_title}
+-----------------------------------
+${t.recovery_status}: ${wellness.recoveryStatus}
+${t.sleep}: ${w.sleep ? w.sleep.toFixed(1) + 'h' : 'N/A'} (${wellness.sleepStatus})
+${t.hrv}: ${w.hrv || 'N/A'} ms (avg: ${wellness.averages.hrv ? wellness.averages.hrv.toFixed(0) : 'N/A'} ms)
+${t.resting_hr}: ${w.restingHR || 'N/A'} bpm
+${w.recovery != null ? `Whoop Recovery: ${w.recovery}%` : ''}
+`;
+  }
+
+  body += `
 ${t.recommendation_title}
 Menu: ${bestWorkout.type}
 Score: ${bestWorkout.recommendationScore}/10
@@ -456,11 +692,11 @@ ${t.other_options}
 `;
 
   for (let i = 1; i < generatedResults.length; i++) {
-    const w = generatedResults[i];
+    const wr = generatedResults[i];
     body += `
-■ Option ${i+1}: ${w.type} (Score: ${w.recommendationScore}/10)
-${w.recommendationReason}
-(See attachment: ${w.fileName})
+■ Option ${i+1}: ${wr.type} (Score: ${wr.recommendationScore}/10)
+${wr.recommendationReason}
+(See attachment: ${wr.fileName})
 `;
   }
 
@@ -471,7 +707,7 @@ ${w.recommendationReason}
 }
 
 // =========================================================
-// 12. DATA PROCESSING & UTILITIES
+// 13. DATA PROCESSING & UTILITIES
 // =========================================================
 function createAthleteSummary(data) {
   const today = new Date();
