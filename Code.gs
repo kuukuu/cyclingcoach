@@ -27,13 +27,18 @@ const USER_SETTINGS = {
   // Target Event Date (YYYY-MM-DD)
   // The AI calculates the training phase (Base/Build/Peak) based on this date.
   // If undefined or far future, it defaults to Base/Maintenance.
-  TARGET_DATE: "2026-06-01", 
+  TARGET_DATE: "2026-06-01",
+
+  // Placeholder-based workout generation
+  // Create placeholders in Intervals.icu like "Aixle - 90min" to trigger generation
+  PLACEHOLDER_PREFIX: "Aixle",  // Workouts starting with this name trigger generation
+  DEFAULT_DURATION: { min: 60, max: 90 },  // Used if no duration specified in placeholder
 
   // System Configuration
   SPREADSHEET_ID: "YOUR_SPREADSHEET_ID", // ID of the Google Sheet for logging
   SHEET_NAME: "training_log",
   WORKOUT_FOLDER: "Aixle_Workouts",      // Google Drive folder name
-  EMAIL_TO: "your_email@example.com" 
+  EMAIL_TO: "your_email@example.com"
 };
 
 // =========================================================
@@ -151,7 +156,116 @@ const HEADERS_FIXED = [
 ];
 
 // =========================================================
-// 6. MAIN FUNCTION: Fetch Data
+// 6. AVAILABILITY: Placeholder-Based Workout Generation
+// =========================================================
+
+/**
+ * Check Intervals.icu calendar for Aixle placeholder workouts
+ * Looks for events starting with PLACEHOLDER_PREFIX (e.g., "Aixle" or "Aixle - 90min")
+ * Returns: { hasPlaceholder: boolean, placeholder: object, duration: {min, max} }
+ */
+function findAixlePlaceholder(dateStr) {
+  const url = "https://intervals.icu/api/v1/athlete/0/events?oldest=" + dateStr + "&newest=" + dateStr;
+  const prefix = USER_SETTINGS.PLACEHOLDER_PREFIX.toLowerCase();
+
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      headers: { "Authorization": ICU_AUTH_HEADER },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() === 200) {
+      const events = JSON.parse(response.getContentText());
+
+      // Find placeholder event starting with "Aixle"
+      const placeholder = events.find(function(e) {
+        return e.name && e.name.toLowerCase().startsWith(prefix);
+      });
+
+      if (placeholder) {
+        // Try to parse duration from name (e.g., "Aixle - 90min" or "Aixle - 120")
+        const duration = parseDurationFromName(placeholder.name);
+
+        return {
+          hasPlaceholder: true,
+          placeholder: placeholder,
+          duration: duration
+        };
+      }
+    }
+  } catch (e) {
+    Logger.log("Error checking Intervals.icu calendar: " + e.toString());
+  }
+
+  return { hasPlaceholder: false, placeholder: null, duration: null };
+}
+
+/**
+ * Parse duration from placeholder name
+ * Supports formats: "Aixle - 90min", "Aixle - 90", "Aixle 90min", "Aixle-90"
+ * Returns: { min: number, max: number } or default duration
+ */
+function parseDurationFromName(name) {
+  const defaultDuration = USER_SETTINGS.DEFAULT_DURATION;
+
+  // Match patterns like "90min", "90 min", "90m", or just "90" after separator
+  const match = name.match(/[\s\-]+(\d+)\s*(min|m)?/i);
+
+  if (match) {
+    const minutes = parseInt(match[1], 10);
+    if (minutes >= 20 && minutes <= 300) {
+      // Give +/- 10% flexibility around the specified duration
+      const buffer = Math.round(minutes * 0.1);
+      return {
+        min: minutes - buffer,
+        max: minutes + buffer
+      };
+    }
+  }
+
+  return defaultDuration;
+}
+
+/**
+ * Determine if workout should be generated today
+ * Checks for Aixle placeholder in Intervals.icu calendar
+ * Returns: { shouldGenerate: boolean, reason: string, duration: {min, max}, placeholder: object }
+ */
+function checkAvailability(wellness) {
+  const todayStr = formatDateISO(new Date());
+  const result = findAixlePlaceholder(todayStr);
+
+  if (!result.hasPlaceholder) {
+    return {
+      shouldGenerate: false,
+      reason: "No Aixle placeholder found for today. Add '" + USER_SETTINGS.PLACEHOLDER_PREFIX + "' or '" + USER_SETTINGS.PLACEHOLDER_PREFIX + " - 90min' to your Intervals.icu calendar.",
+      duration: null,
+      placeholder: null
+    };
+  }
+
+  // Found placeholder - extract info
+  const placeholderName = result.placeholder.name;
+  const duration = result.duration;
+
+  // Add recovery note if wellness data available
+  let recoveryNote = "";
+  if (wellness && wellness.available) {
+    if (wellness.today.recovery != null && wellness.today.recovery < 34) {
+      recoveryNote = " | Low recovery (" + wellness.today.recovery + "%)";
+    }
+  }
+
+  return {
+    shouldGenerate: true,
+    reason: "Found placeholder: " + placeholderName + recoveryNote,
+    duration: duration,
+    placeholder: result.placeholder
+  };
+}
+
+// =========================================================
+// 7. MAIN FUNCTION: Fetch Data
 // =========================================================
 function fetchAndLogActivities() {
   const sheet = SpreadsheetApp.openById(USER_SETTINGS.SPREADSHEET_ID).getSheetByName(USER_SETTINGS.SHEET_NAME);
@@ -190,9 +304,21 @@ function fetchAndLogActivities() {
 }
 
 // =========================================================
-// 7. MAIN FUNCTION: Generate Workouts
+// 8. MAIN FUNCTION: Generate Workouts
 // =========================================================
 function generateOptimalZwiftWorkoutsAutoByGemini() {
+  const today = new Date();
+
+  // Check for Aixle placeholder in Intervals.icu calendar
+  const availability = checkAvailability(null);
+
+  if (!availability.shouldGenerate) {
+    Logger.log("Skipping workout generation: " + availability.reason);
+    return;
+  }
+
+  Logger.log("Availability check passed: " + availability.reason);
+
   const folder = getOrCreateFolder(USER_SETTINGS.WORKOUT_FOLDER);
   const sheet = SpreadsheetApp.openById(USER_SETTINGS.SPREADSHEET_ID).getSheetByName(USER_SETTINGS.SHEET_NAME);
   const data = sheet.getDataRange().getValues();
@@ -200,26 +326,26 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
   // Create Athlete Summary
   const summary = createAthleteSummary(data);
-  
+
   // Calculate Periodization Phase
   const phaseInfo = calculateTrainingPhase(USER_SETTINGS.TARGET_DATE);
-  Logger.log(`Athlete Summary: TSB=${summary.tsb_current.toFixed(1)}`);
-  Logger.log(`Current Phase: ${phaseInfo.phaseName} (${phaseInfo.weeksOut} weeks out)`);
+  Logger.log("Athlete Summary: TSB=" + summary.tsb_current.toFixed(1));
+  Logger.log("Current Phase: " + phaseInfo.phaseName + " (" + phaseInfo.weeksOut + " weeks out)");
+  Logger.log("Target Duration: " + availability.duration.min + "-" + availability.duration.max + " min");
 
   // Workout Types to Generate
   const types = ["FTP_Threshold", "VO2max_HighIntensity", "Endurance_Tempo"];
-  
-  const today = new Date();
+
   const dateStr = Utilities.formatDate(today, SYSTEM_SETTINGS.TIMEZONE, "MMdd");
   const fileDateStr = Utilities.formatDate(today, SYSTEM_SETTINGS.TIMEZONE, "yyyyMMdd");
-  
+
   let generatedResults = [];
 
   for (const type of types) {
-    Logger.log(`Generating workout for: ${type}...`);
-    
-    // Create Prompt
-    const prompt = createPrompt(type, summary, phaseInfo, dateStr);
+    Logger.log("Generating workout for: " + type + "...");
+
+    // Create Prompt (now includes duration)
+    const prompt = createPrompt(type, summary, phaseInfo, dateStr, availability.duration);
 
     // Call Gemini API
     const result = callGeminiAPI(prompt);
@@ -364,15 +490,18 @@ function callGeminiAPI(prompt) {
 }
 
 // =========================================================
-// 10. HELPER: Prompt Construction
+// 11. HELPER: Prompt Construction
 // =========================================================
-function createPrompt(type, summary, phaseInfo, dateStr) {
+function createPrompt(type, summary, phaseInfo, dateStr, duration) {
   const langMap = { "ja": "Japanese", "en": "English", "es": "Spanish", "fr": "French" };
   const analysisLang = langMap[USER_SETTINGS.LANGUAGE] || "English";
 
   // Zwift Display Name (Clean, short name without "Aixle_" prefix)
   const safeType = type.replace(/[^a-zA-Z0-9]/g,"");
-  const zwiftDisplayName = `${safeType}_${dateStr}`; 
+  const zwiftDisplayName = safeType + "_" + dateStr;
+
+  // Format duration string
+  const durationStr = duration ? (duration.min + "-" + duration.max + " min") : "60 min (+/- 5min)";
 
   return `
 You are an expert cycling coach using the logic of Coggan, Friel, and Seiler.
@@ -387,13 +516,13 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
 - **Recent Load (Z5+):** ${summary.z5_recent_total > 1500 ? "High" : "Normal"}
 
 **2. Assignment: Design a "${type}" Workout**
-- **Duration:** 60 min (+/- 5min).
+- **Duration:** ${durationStr}. Design the workout to fit within this time window.
 - **Structure:** Engaging (Pyramids, Over-Unders). NO boring steady states.
 - **Intensity:** Adjust based on TSB. If TSB < -20, reduce intensity significantly.
 
 **3. REQUIRED ZWO FEATURES (Critical):**
 - **Cadence:** You MUST specify target cadence for every interval using \`Cadence="85"\`.
-- **Text Events (Messages):** 
+- **Text Events (Messages):**
   - You MUST include motivational or instructional text messages.
   - **LANGUAGE: Messages MUST be in ENGLISH.** (Even if the user's language is different, Zwift works best with English text).
   - Nest them: \`<SteadyState ... ><TextEvent timeoffset="10" message="Keep pushing!"/></SteadyState>\`
