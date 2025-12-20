@@ -29,11 +29,27 @@ const USER_SETTINGS = {
   // If undefined or far future, it defaults to Base/Maintenance.
   TARGET_DATE: "2026-06-01", 
 
+  // Training Schedule & Availability
+  TRAINING_SCHEDULE: {
+    // Days available for training (0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat)
+    trainingDays: [2, 4, 6],  // Tuesday, Thursday, Saturday
+
+    // Duration settings (in minutes)
+    weekdayDuration: { min: 60, max: 90 },   // 1-1.5 hours
+    weekendDuration: { min: 120, max: 180 }, // 2-3 hours
+
+    // Skip generation if Intervals.icu already has a workout planned
+    checkExistingWorkouts: true,
+
+    // Recovery threshold - skip high intensity if below this (0-100, null to disable)
+    minRecoveryForIntensity: 34  // Skip VO2max/Threshold if recovery < 34%
+  },
+
   // System Configuration
   SPREADSHEET_ID: "YOUR_SPREADSHEET_ID", // ID of the Google Sheet for logging
   SHEET_NAME: "training_log",
   WORKOUT_FOLDER: "Aixle_Workouts",      // Google Drive folder name
-  EMAIL_TO: "your_email@example.com" 
+  EMAIL_TO: "your_email@example.com"
 };
 
 // =========================================================
@@ -151,7 +167,115 @@ const HEADERS_FIXED = [
 ];
 
 // =========================================================
-// 6. MAIN FUNCTION: Fetch Data
+// 6. AVAILABILITY: Training Schedule & Calendar Checks
+// =========================================================
+
+/**
+ * Check if today is a scheduled training day
+ * Returns: { isTrainingDay: boolean, dayName: string, duration: {min, max} }
+ */
+function checkTrainingDay() {
+  const today = new Date();
+  const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const schedule = USER_SETTINGS.TRAINING_SCHEDULE;
+
+  const isTrainingDay = schedule.trainingDays.includes(dayOfWeek);
+  const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+  const duration = isWeekend ? schedule.weekendDuration : schedule.weekdayDuration;
+
+  return {
+    isTrainingDay: isTrainingDay,
+    dayName: dayNames[dayOfWeek],
+    dayOfWeek: dayOfWeek,
+    isWeekend: isWeekend,
+    duration: duration
+  };
+}
+
+/**
+ * Check Intervals.icu calendar for existing events/workouts on a given date
+ * Returns: { hasExisting: boolean, events: [] }
+ */
+function checkIntervalsCalendar(dateStr) {
+  const url = "https://intervals.icu/api/v1/athlete/0/events?oldest=" + dateStr + "&newest=" + dateStr;
+
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      headers: { "Authorization": ICU_AUTH_HEADER },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() === 200) {
+      const events = JSON.parse(response.getContentText());
+      // Filter for workouts/rides (not notes or other events)
+      const workoutEvents = events.filter(function(e) {
+        return e.category === "WORKOUT" || e.category === "RACE" || e.type === "Ride";
+      });
+
+      return {
+        hasExisting: workoutEvents.length > 0,
+        events: workoutEvents
+      };
+    }
+  } catch (e) {
+    Logger.log("Error checking Intervals.icu calendar: " + e.toString());
+  }
+
+  return { hasExisting: false, events: [] };
+}
+
+/**
+ * Determine training availability for today
+ * Combines: schedule check + calendar check + recovery check
+ * Returns: { shouldGenerate: boolean, reason: string, duration: {min, max} }
+ */
+function checkAvailability(wellness) {
+  const schedule = USER_SETTINGS.TRAINING_SCHEDULE;
+  const trainingDay = checkTrainingDay();
+
+  // Check 1: Is today a training day?
+  if (!trainingDay.isTrainingDay) {
+    return {
+      shouldGenerate: false,
+      reason: "Not a scheduled training day (" + trainingDay.dayName + ")",
+      duration: null
+    };
+  }
+
+  // Check 2: Is there already a workout planned in Intervals.icu?
+  if (schedule.checkExistingWorkouts) {
+    const todayStr = formatDateISO(new Date());
+    const calendar = checkIntervalsCalendar(todayStr);
+
+    if (calendar.hasExisting) {
+      const existingNames = calendar.events.map(function(e) { return e.name; }).join(", ");
+      return {
+        shouldGenerate: false,
+        reason: "Workout already planned: " + existingNames,
+        duration: null
+      };
+    }
+  }
+
+  // Check 3: Recovery-based adjustment (optional - only if wellness available)
+  let recoveryNote = "";
+  if (wellness && wellness.available && schedule.minRecoveryForIntensity) {
+    if (wellness.today.recovery != null && wellness.today.recovery < schedule.minRecoveryForIntensity) {
+      recoveryNote = " (Low recovery: " + wellness.today.recovery + "% - will favor endurance)";
+    }
+  }
+
+  return {
+    shouldGenerate: true,
+    reason: "Training day (" + trainingDay.dayName + ")" + recoveryNote,
+    duration: trainingDay.duration,
+    isWeekend: trainingDay.isWeekend
+  };
+}
+
+// =========================================================
+// 7. MAIN FUNCTION: Fetch Data
 // =========================================================
 function fetchAndLogActivities() {
   const sheet = SpreadsheetApp.openById(USER_SETTINGS.SPREADSHEET_ID).getSheetByName(USER_SETTINGS.SHEET_NAME);
@@ -190,9 +314,21 @@ function fetchAndLogActivities() {
 }
 
 // =========================================================
-// 7. MAIN FUNCTION: Generate Workouts
+// 8. MAIN FUNCTION: Generate Workouts
 // =========================================================
 function generateOptimalZwiftWorkoutsAutoByGemini() {
+  const today = new Date();
+
+  // Check availability first (pass null for wellness, we'll check again after)
+  const availability = checkAvailability(null);
+
+  if (!availability.shouldGenerate) {
+    Logger.log("Skipping workout generation: " + availability.reason);
+    return;
+  }
+
+  Logger.log("Availability check passed: " + availability.reason);
+
   const folder = getOrCreateFolder(USER_SETTINGS.WORKOUT_FOLDER);
   const sheet = SpreadsheetApp.openById(USER_SETTINGS.SPREADSHEET_ID).getSheetByName(USER_SETTINGS.SHEET_NAME);
   const data = sheet.getDataRange().getValues();
@@ -200,26 +336,26 @@ function generateOptimalZwiftWorkoutsAutoByGemini() {
 
   // Create Athlete Summary
   const summary = createAthleteSummary(data);
-  
+
   // Calculate Periodization Phase
   const phaseInfo = calculateTrainingPhase(USER_SETTINGS.TARGET_DATE);
-  Logger.log(`Athlete Summary: TSB=${summary.tsb_current.toFixed(1)}`);
-  Logger.log(`Current Phase: ${phaseInfo.phaseName} (${phaseInfo.weeksOut} weeks out)`);
+  Logger.log("Athlete Summary: TSB=" + summary.tsb_current.toFixed(1));
+  Logger.log("Current Phase: " + phaseInfo.phaseName + " (" + phaseInfo.weeksOut + " weeks out)");
+  Logger.log("Target Duration: " + availability.duration.min + "-" + availability.duration.max + " min");
 
   // Workout Types to Generate
   const types = ["FTP_Threshold", "VO2max_HighIntensity", "Endurance_Tempo"];
-  
-  const today = new Date();
+
   const dateStr = Utilities.formatDate(today, SYSTEM_SETTINGS.TIMEZONE, "MMdd");
   const fileDateStr = Utilities.formatDate(today, SYSTEM_SETTINGS.TIMEZONE, "yyyyMMdd");
-  
+
   let generatedResults = [];
 
   for (const type of types) {
-    Logger.log(`Generating workout for: ${type}...`);
-    
-    // Create Prompt
-    const prompt = createPrompt(type, summary, phaseInfo, dateStr);
+    Logger.log("Generating workout for: " + type + "...");
+
+    // Create Prompt (now includes duration)
+    const prompt = createPrompt(type, summary, phaseInfo, dateStr, availability.duration);
 
     // Call Gemini API
     const result = callGeminiAPI(prompt);
@@ -364,15 +500,18 @@ function callGeminiAPI(prompt) {
 }
 
 // =========================================================
-// 10. HELPER: Prompt Construction
+// 11. HELPER: Prompt Construction
 // =========================================================
-function createPrompt(type, summary, phaseInfo, dateStr) {
+function createPrompt(type, summary, phaseInfo, dateStr, duration) {
   const langMap = { "ja": "Japanese", "en": "English", "es": "Spanish", "fr": "French" };
   const analysisLang = langMap[USER_SETTINGS.LANGUAGE] || "English";
 
   // Zwift Display Name (Clean, short name without "Aixle_" prefix)
   const safeType = type.replace(/[^a-zA-Z0-9]/g,"");
-  const zwiftDisplayName = `${safeType}_${dateStr}`; 
+  const zwiftDisplayName = safeType + "_" + dateStr;
+
+  // Format duration string
+  const durationStr = duration ? (duration.min + "-" + duration.max + " min") : "60 min (+/- 5min)";
 
   return `
 You are an expert cycling coach using the logic of Coggan, Friel, and Seiler.
@@ -387,13 +526,13 @@ Generate a Zwift workout (.zwo) and evaluate its suitability.
 - **Recent Load (Z5+):** ${summary.z5_recent_total > 1500 ? "High" : "Normal"}
 
 **2. Assignment: Design a "${type}" Workout**
-- **Duration:** 60 min (+/- 5min).
+- **Duration:** ${durationStr}. Design the workout to fit within this time window.
 - **Structure:** Engaging (Pyramids, Over-Unders). NO boring steady states.
 - **Intensity:** Adjust based on TSB. If TSB < -20, reduce intensity significantly.
 
 **3. REQUIRED ZWO FEATURES (Critical):**
 - **Cadence:** You MUST specify target cadence for every interval using \`Cadence="85"\`.
-- **Text Events (Messages):** 
+- **Text Events (Messages):**
   - You MUST include motivational or instructional text messages.
   - **LANGUAGE: Messages MUST be in ENGLISH.** (Even if the user's language is different, Zwift works best with English text).
   - Nest them: \`<SteadyState ... ><TextEvent timeoffset="10" message="Keep pushing!"/></SteadyState>\`
