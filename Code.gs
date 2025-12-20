@@ -27,23 +27,12 @@ const USER_SETTINGS = {
   // Target Event Date (YYYY-MM-DD)
   // The AI calculates the training phase (Base/Build/Peak) based on this date.
   // If undefined or far future, it defaults to Base/Maintenance.
-  TARGET_DATE: "2026-06-01", 
+  TARGET_DATE: "2026-06-01",
 
-  // Training Schedule & Availability
-  TRAINING_SCHEDULE: {
-    // Days available for training (0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat)
-    trainingDays: [2, 4, 6],  // Tuesday, Thursday, Saturday
-
-    // Duration settings (in minutes)
-    weekdayDuration: { min: 60, max: 90 },   // 1-1.5 hours
-    weekendDuration: { min: 120, max: 180 }, // 2-3 hours
-
-    // Skip generation if Intervals.icu already has a workout planned
-    checkExistingWorkouts: true,
-
-    // Recovery threshold - skip high intensity if below this (0-100, null to disable)
-    minRecoveryForIntensity: 34  // Skip VO2max/Threshold if recovery < 34%
-  },
+  // Placeholder-based workout generation
+  // Create placeholders in Intervals.icu like "Aixle - 90min" to trigger generation
+  PLACEHOLDER_PREFIX: "Aixle",  // Workouts starting with this name trigger generation
+  DEFAULT_DURATION: { min: 60, max: 90 },  // Used if no duration specified in placeholder
 
   // System Configuration
   SPREADSHEET_ID: "YOUR_SPREADSHEET_ID", // ID of the Google Sheet for logging
@@ -167,38 +156,17 @@ const HEADERS_FIXED = [
 ];
 
 // =========================================================
-// 6. AVAILABILITY: Training Schedule & Calendar Checks
+// 6. AVAILABILITY: Placeholder-Based Workout Generation
 // =========================================================
 
 /**
- * Check if today is a scheduled training day
- * Returns: { isTrainingDay: boolean, dayName: string, duration: {min, max} }
+ * Check Intervals.icu calendar for Aixle placeholder workouts
+ * Looks for events starting with PLACEHOLDER_PREFIX (e.g., "Aixle" or "Aixle - 90min")
+ * Returns: { hasPlaceholder: boolean, placeholder: object, duration: {min, max} }
  */
-function checkTrainingDay() {
-  const today = new Date();
-  const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const schedule = USER_SETTINGS.TRAINING_SCHEDULE;
-
-  const isTrainingDay = schedule.trainingDays.includes(dayOfWeek);
-  const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
-  const duration = isWeekend ? schedule.weekendDuration : schedule.weekdayDuration;
-
-  return {
-    isTrainingDay: isTrainingDay,
-    dayName: dayNames[dayOfWeek],
-    dayOfWeek: dayOfWeek,
-    isWeekend: isWeekend,
-    duration: duration
-  };
-}
-
-/**
- * Check Intervals.icu calendar for existing events/workouts on a given date
- * Returns: { hasExisting: boolean, events: [] }
- */
-function checkIntervalsCalendar(dateStr) {
+function findAixlePlaceholder(dateStr) {
   const url = "https://intervals.icu/api/v1/athlete/0/events?oldest=" + dateStr + "&newest=" + dateStr;
+  const prefix = USER_SETTINGS.PLACEHOLDER_PREFIX.toLowerCase();
 
   try {
     const response = UrlFetchApp.fetch(url, {
@@ -208,69 +176,91 @@ function checkIntervalsCalendar(dateStr) {
 
     if (response.getResponseCode() === 200) {
       const events = JSON.parse(response.getContentText());
-      // Filter for workouts/rides (not notes or other events)
-      const workoutEvents = events.filter(function(e) {
-        return e.category === "WORKOUT" || e.category === "RACE" || e.type === "Ride";
+
+      // Find placeholder event starting with "Aixle"
+      const placeholder = events.find(function(e) {
+        return e.name && e.name.toLowerCase().startsWith(prefix);
       });
 
-      return {
-        hasExisting: workoutEvents.length > 0,
-        events: workoutEvents
-      };
+      if (placeholder) {
+        // Try to parse duration from name (e.g., "Aixle - 90min" or "Aixle - 120")
+        const duration = parseDurationFromName(placeholder.name);
+
+        return {
+          hasPlaceholder: true,
+          placeholder: placeholder,
+          duration: duration
+        };
+      }
     }
   } catch (e) {
     Logger.log("Error checking Intervals.icu calendar: " + e.toString());
   }
 
-  return { hasExisting: false, events: [] };
+  return { hasPlaceholder: false, placeholder: null, duration: null };
 }
 
 /**
- * Determine training availability for today
- * Combines: schedule check + calendar check + recovery check
- * Returns: { shouldGenerate: boolean, reason: string, duration: {min, max} }
+ * Parse duration from placeholder name
+ * Supports formats: "Aixle - 90min", "Aixle - 90", "Aixle 90min", "Aixle-90"
+ * Returns: { min: number, max: number } or default duration
  */
-function checkAvailability(wellness) {
-  const schedule = USER_SETTINGS.TRAINING_SCHEDULE;
-  const trainingDay = checkTrainingDay();
+function parseDurationFromName(name) {
+  const defaultDuration = USER_SETTINGS.DEFAULT_DURATION;
 
-  // Check 1: Is today a training day?
-  if (!trainingDay.isTrainingDay) {
-    return {
-      shouldGenerate: false,
-      reason: "Not a scheduled training day (" + trainingDay.dayName + ")",
-      duration: null
-    };
-  }
+  // Match patterns like "90min", "90 min", "90m", or just "90" after separator
+  const match = name.match(/[\s\-]+(\d+)\s*(min|m)?/i);
 
-  // Check 2: Is there already a workout planned in Intervals.icu?
-  if (schedule.checkExistingWorkouts) {
-    const todayStr = formatDateISO(new Date());
-    const calendar = checkIntervalsCalendar(todayStr);
-
-    if (calendar.hasExisting) {
-      const existingNames = calendar.events.map(function(e) { return e.name; }).join(", ");
+  if (match) {
+    const minutes = parseInt(match[1], 10);
+    if (minutes >= 20 && minutes <= 300) {
+      // Give +/- 10% flexibility around the specified duration
+      const buffer = Math.round(minutes * 0.1);
       return {
-        shouldGenerate: false,
-        reason: "Workout already planned: " + existingNames,
-        duration: null
+        min: minutes - buffer,
+        max: minutes + buffer
       };
     }
   }
 
-  // Check 3: Recovery-based adjustment (optional - only if wellness available)
+  return defaultDuration;
+}
+
+/**
+ * Determine if workout should be generated today
+ * Checks for Aixle placeholder in Intervals.icu calendar
+ * Returns: { shouldGenerate: boolean, reason: string, duration: {min, max}, placeholder: object }
+ */
+function checkAvailability(wellness) {
+  const todayStr = formatDateISO(new Date());
+  const result = findAixlePlaceholder(todayStr);
+
+  if (!result.hasPlaceholder) {
+    return {
+      shouldGenerate: false,
+      reason: "No Aixle placeholder found for today. Add '" + USER_SETTINGS.PLACEHOLDER_PREFIX + "' or '" + USER_SETTINGS.PLACEHOLDER_PREFIX + " - 90min' to your Intervals.icu calendar.",
+      duration: null,
+      placeholder: null
+    };
+  }
+
+  // Found placeholder - extract info
+  const placeholderName = result.placeholder.name;
+  const duration = result.duration;
+
+  // Add recovery note if wellness data available
   let recoveryNote = "";
-  if (wellness && wellness.available && schedule.minRecoveryForIntensity) {
-    if (wellness.today.recovery != null && wellness.today.recovery < schedule.minRecoveryForIntensity) {
-      recoveryNote = " (Low recovery: " + wellness.today.recovery + "% - will favor endurance)";
+  if (wellness && wellness.available) {
+    if (wellness.today.recovery != null && wellness.today.recovery < 34) {
+      recoveryNote = " | Low recovery (" + wellness.today.recovery + "%)";
     }
   }
 
   return {
     shouldGenerate: true,
-    reason: "Training day (" + trainingDay.dayName + ")" + recoveryNote,
-    duration: trainingDay.duration,
-    isWeekend: trainingDay.isWeekend
+    reason: "Found placeholder: " + placeholderName + recoveryNote,
+    duration: duration,
+    placeholder: result.placeholder
   };
 }
 
@@ -319,7 +309,7 @@ function fetchAndLogActivities() {
 function generateOptimalZwiftWorkoutsAutoByGemini() {
   const today = new Date();
 
-  // Check availability first (pass null for wellness, we'll check again after)
+  // Check for Aixle placeholder in Intervals.icu calendar
   const availability = checkAvailability(null);
 
   if (!availability.shouldGenerate) {
